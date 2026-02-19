@@ -141,6 +141,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
     base_prompt = _format_prompt()
     base_prompt_token_ids = state.tokenizer(base_prompt, add_special_tokens=False)["input_ids"]
+    prompt_len = len(base_prompt_token_ids)
 
     if not sample.tokens:
         sample.tokens = list(base_prompt_token_ids)
@@ -151,14 +152,32 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     else:
         _init_or_align_response_fields(sample)
 
+    def _finalize(status: Sample.Status, **meta) -> Sample:
+        sample.status = status
+        sample.metadata.update(meta)
+        sample.response = state.tokenizer.decode(
+            sample.tokens[prompt_len:], skip_special_tokens=False
+        )
+        return sample
+
     max_turns = _get_max_turns(args)
+    budget: int | None = sampling_params.get("max_new_tokens")
 
     for turn_idx in range(max_turns):
+        if budget is not None and budget <= 0:
+            return _finalize(Sample.Status.TRUNCATED, budget_exhausted=True)
+
+        cur_sampling_params = (
+            {**sampling_params, "max_new_tokens": budget}
+            if budget is not None
+            else sampling_params
+        )
+
         output = await post(
             url,
             {
                 "input_ids": sample.tokens,
-                "sampling_params": sampling_params,
+                "sampling_params": cur_sampling_params,
                 "return_logprob": True,
             },
         )
@@ -168,7 +187,6 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             sample.status = Sample.Status.ABORTED
             return sample
 
-        cur_text = output.get("text", "")
         cur_token_ids, cur_log_probs = _extract_output_tokens_and_logprobs(output, state.tokenizer)
 
         if sample.loss_mask is None:
@@ -177,21 +195,17 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             sample.rollout_log_probs = []
 
         sample.tokens += cur_token_ids
-        sample.response += cur_text
         sample.response_length += len(cur_token_ids)
         sample.loss_mask += [1] * len(cur_token_ids)
         sample.rollout_log_probs += cur_log_probs
+        budget = (budget - len(cur_token_ids)) if budget is not None else None
 
         if finish_reason == "length":
-            sample.status = Sample.Status.TRUNCATED
-            sample.metadata["tool_turns"] = turn_idx + 1
-            return sample
+            return _finalize(Sample.Status.TRUNCATED, tool_turns=turn_idx + 1)
 
-        tool_calls = _parse_tool_calls(cur_text)
+        tool_calls = _parse_tool_calls(output.get("text", ""))
         if not tool_calls:
-            sample.status = Sample.Status.COMPLETED
-            sample.metadata["tool_turns"] = turn_idx + 1
-            return sample
+            return _finalize(Sample.Status.COMPLETED, tool_turns=turn_idx + 1)
 
         finished_by_action = False
         for tool_call in tool_calls:
@@ -207,20 +221,14 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             obs = "\n" + json.dumps(result, ensure_ascii=True) + "\n"
             obs_token_ids = state.tokenizer(obs, add_special_tokens=False)["input_ids"]
             sample.tokens += obs_token_ids
-            sample.response += obs
             sample.response_length += len(obs_token_ids)
             sample.loss_mask += [0] * len(obs_token_ids)
             sample.rollout_log_probs += [0.0] * len(obs_token_ids)
 
         if finished_by_action:
-            sample.status = Sample.Status.COMPLETED
-            sample.metadata["tool_turns"] = turn_idx + 1
-            return sample
+            return _finalize(Sample.Status.COMPLETED, tool_turns=turn_idx + 1)
 
-    sample.status = Sample.Status.TRUNCATED
-    sample.metadata["max_turns_reached"] = max_turns
-    return sample
+    return _finalize(Sample.Status.TRUNCATED, max_turns_reached=max_turns)
 
 
 __all__ = ["generate"]
-

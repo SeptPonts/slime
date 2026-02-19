@@ -9,7 +9,7 @@ pkill -f "slime.router" >/dev/null 2>&1 || true
 sleep 2
 
 # Keep stdout/stderr unbuffered for Ray log streaming.
-export PYTHONBUFFERED=16
+export PYTHONUNBUFFERED=1
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
