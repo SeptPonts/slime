@@ -37,7 +37,7 @@
 
 1. 入口兼容层：
 - `/Users/qitongli/Developer/slime/examples/holdem_game/generate_with_holdem.py`
-- 只 re-export 两个符号：`generate`、`reward_func`
+- re-export 三个符号：`generate`、`reward_func`、`log_rollout_data`
 
 2. rollout 逻辑：
 - `/Users/qitongli/Developer/slime/examples/holdem_game/holdem_rollout.py`

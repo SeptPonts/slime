@@ -224,6 +224,7 @@ MISC_ARGS=(
 CUSTOM_ARGS=(
    --custom-generate-function-path generate_with_holdem.generate
    --custom-rm-path generate_with_holdem.reward_func
+   --custom-rollout-log-function-path generate_with_holdem.log_rollout_data
 )
 
 # OOM tuning order: max-tokens-per-gpu -> context-parallel-size ->
