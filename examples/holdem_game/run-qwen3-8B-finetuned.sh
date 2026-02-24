@@ -22,19 +22,19 @@ if [[ "${RUN_PROFILE}" != "full" && "${RUN_PROFILE}" != "smoke" ]]; then
 fi
 
 # -----------------------------
-# Topology / parallel constants
+# Topology / parallel constants  (env-overridable for non-4-GPU setups)
 # -----------------------------
-ACTOR_NUM_NODES=1
-ACTOR_NUM_GPUS_PER_NODE=4
-ROLLOUT_NUM_GPUS_PER_ENGINE=2
-RAY_NUM_GPUS=4
-USE_COLOCATE=1
+ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-1}"
+ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-4}"
+ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
+RAY_NUM_GPUS="${RAY_NUM_GPUS:-4}"
+USE_COLOCATE="${USE_COLOCATE:-1}"
 
-TP=2
-PP=1
-CP=1
-EP=1
-ETP=1
+TP="${TP:-2}"
+PP="${PP:-1}"
+CP="${CP:-1}"
+EP="${EP:-1}"
+ETP="${ETP:-1}"
 
 # -----------------------------
 # Training constants (full)
@@ -46,14 +46,14 @@ GLOBAL_BS_FULL=128
 MAX_RESP_LEN_FULL=4096
 
 # -----------------------------
-# DAPO / perf constants
+# DAPO / perf constants  (env-overridable)
 # -----------------------------
-OVER_SAMPLING_BS=32
-ENABLE_DYNAMIC_SAMPLING=1
-ENABLE_PARTIAL_ROLLOUT=1
-MAX_TOKENS_PER_GPU=8192
-SGLANG_MEM_FRAC=0.45
-SGLANG_SERVER_CONCURRENCY=256
+OVER_SAMPLING_BS="${OVER_SAMPLING_BS:-32}"
+ENABLE_DYNAMIC_SAMPLING="${ENABLE_DYNAMIC_SAMPLING:-1}"
+ENABLE_PARTIAL_ROLLOUT="${ENABLE_PARTIAL_ROLLOUT:-1}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-8192}"
+SGLANG_MEM_FRAC="${SGLANG_MEM_FRAC:-0.45}"
+SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-256}"
 
 # -----------------------------
 # Checkpoint / data paths
@@ -108,11 +108,13 @@ if (( RAY_NUM_GPUS != ROLLOUT_NUM_GPUS )); then
     exit 1
 fi
 
-NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
+NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l) || NVLINK_COUNT=0
 if [ "${NVLINK_COUNT}" -gt 0 ]; then
     HAS_NVLINK=1
+    echo "NVLink detected (${NVLINK_COUNT} references): NCCL_NVLS_ENABLE=1"
 else
     HAS_NVLINK=0
+    echo "No NVLink detected: NCCL_NVLS_ENABLE=0"
 fi
 
 echo "RUN_PROFILE=${RUN_PROFILE}"
@@ -198,13 +200,17 @@ OPTIMIZER_ARGS=(
    --adam-beta2 0.98
 )
 
-WANDB_ARGS=(
-   --use-wandb
-   --wandb-project slime-holdem
-   --wandb-group qwen3-8B-holdem
-)
+WANDB_ARGS=()
 if [[ -n "${WANDB_KEY:-}" ]]; then
-    WANDB_ARGS+=(--wandb-key "${WANDB_KEY}")
+    echo "WANDB_KEY set: enabling wandb logging (project=slime-holdem, group=qwen3-8B-holdem)"
+    WANDB_ARGS+=(
+        --use-wandb
+        --wandb-project slime-holdem
+        --wandb-group qwen3-8B-holdem
+        --wandb-key "${WANDB_KEY}"
+    )
+else
+    echo "WANDB_KEY not set: wandb logging disabled"
 fi
 
 SGLANG_ARGS=(
