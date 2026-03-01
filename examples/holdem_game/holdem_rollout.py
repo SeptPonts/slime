@@ -74,26 +74,31 @@ def _parse_tool_calls(text: str) -> list[dict[str, Any]]:
 
 
 def _extract_output_tokens_and_logprobs(output: dict, tokenizer) -> tuple[list[int], list[float]]:
+    del tokenizer
     meta_info = output.get("meta_info", {})
-    entries = meta_info.get("output_token_logprobs") or []
+    if "output_token_logprobs" not in meta_info:
+        raise RuntimeError("output_token_logprobs is missing in rollout response")
+
+    entries = meta_info.get("output_token_logprobs")
+    if not isinstance(entries, list):
+        raise RuntimeError("output_token_logprobs must be a list")
+    if not entries:
+        return [], []
 
     token_ids: list[int] = []
     log_probs: list[float] = []
     for entry in entries:
         if not isinstance(entry, (list, tuple)) or len(entry) < 2:
-            continue
+            raise RuntimeError("invalid output_token_logprobs entry format")
         try:
             log_probs.append(float(entry[0]))
             token_ids.append(int(entry[1]))
         except (TypeError, ValueError):
-            continue
+            raise RuntimeError("invalid output_token_logprobs entry values") from None
 
-    if token_ids:
-        return token_ids, log_probs
+    if len(token_ids) != len(log_probs):
+        raise RuntimeError("token/logprob length mismatch in rollout response")
 
-    text = output.get("text", "")
-    token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-    log_probs = [0.0] * len(token_ids)
     return token_ids, log_probs
 
 
@@ -118,12 +123,43 @@ def _init_or_align_response_fields(sample: Sample) -> None:
             sample.rollout_log_probs = sample.rollout_log_probs[: sample.response_length]
 
 
+def _sync_response_from_tokens(sample: Sample, tokenizer, prompt_len: int) -> None:
+    sample.response = tokenizer.decode(sample.tokens[prompt_len:], skip_special_tokens=False)
+
+
+def _assert_alignment(sample: Sample, where: str) -> None:
+    if sample.loss_mask is None or sample.rollout_log_probs is None:
+        raise AssertionError(f"{where}: loss_mask/rollout_log_probs should not be None")
+    if len(sample.loss_mask) != sample.response_length:
+        raise AssertionError(
+            f"{where}: loss_mask length {len(sample.loss_mask)} != response_length {sample.response_length}"
+        )
+    if len(sample.rollout_log_probs) != sample.response_length:
+        raise AssertionError(
+            f"{where}: rollout_log_probs length {len(sample.rollout_log_probs)} != response_length {sample.response_length}"
+        )
+
+
+def _fail_sample(sample: Sample, reason: str, tokenizer, prompt_len: int, **meta) -> Sample:
+    sample.status = Sample.Status.FAILED
+    sample.remove_sample = True
+    sample.metadata["generate_error"] = reason
+    sample.metadata.update(meta)
+    _init_or_align_response_fields(sample)
+    _sync_response_from_tokens(sample, tokenizer, prompt_len)
+    _assert_alignment(sample, "fail")
+    return sample
+
+
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     from slime.rollout.sglang_rollout import GenerateState
+
+    prompt_len = 0
 
     if not isinstance(sample.prompt, str):
         sample.status = Sample.Status.FAILED
         sample.metadata["generate_error"] = "sample.prompt must be str for holdem rollout"
+        sample.remove_sample = True
         return sample
 
     try:
@@ -134,6 +170,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     except Exception as exc:
         sample.status = Sample.Status.FAILED
         sample.metadata["generate_error"] = f"failed to parse game state: {exc}"
+        sample.remove_sample = True
         return sample
 
     state = GenerateState(args)
@@ -151,13 +188,13 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         sample.rollout_log_probs = []
     else:
         _init_or_align_response_fields(sample)
+        _assert_alignment(sample, "init")
 
     def _finalize(status: Sample.Status, **meta) -> Sample:
         sample.status = status
         sample.metadata.update(meta)
-        sample.response = state.tokenizer.decode(
-            sample.tokens[prompt_len:], skip_special_tokens=False
-        )
+        _sync_response_from_tokens(sample, state.tokenizer, prompt_len)
+        _assert_alignment(sample, "finalize")
         return sample
 
     max_turns = _get_max_turns(args)
@@ -184,10 +221,18 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
         finish_reason = output.get("meta_info", {}).get("finish_reason", {}).get("type", "stop")
         if finish_reason == "abort":
-            sample.status = Sample.Status.ABORTED
-            return sample
+            return _finalize(Sample.Status.ABORTED, abort_reason="sglang_abort")
 
-        cur_token_ids, cur_log_probs = _extract_output_tokens_and_logprobs(output, state.tokenizer)
+        try:
+            cur_token_ids, cur_log_probs = _extract_output_tokens_and_logprobs(output, state.tokenizer)
+        except RuntimeError as exc:
+            return _fail_sample(
+                sample,
+                reason=f"logprob_error: {exc}",
+                tokenizer=state.tokenizer,
+                prompt_len=prompt_len,
+                logprob_error=str(exc),
+            )
 
         if sample.loss_mask is None:
             sample.loss_mask = []
@@ -198,6 +243,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         sample.response_length += len(cur_token_ids)
         sample.loss_mask += [1] * len(cur_token_ids)
         sample.rollout_log_probs += cur_log_probs
+        _assert_alignment(sample, "model_append")
         budget = (budget - len(cur_token_ids)) if budget is not None else None
 
         if finish_reason == "length":
@@ -224,6 +270,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             sample.response_length += len(obs_token_ids)
             sample.loss_mask += [0] * len(obs_token_ids)
             sample.rollout_log_probs += [0.0] * len(obs_token_ids)
+            _assert_alignment(sample, "tool_obs_append")
 
         if finished_by_action:
             return _finalize(Sample.Status.COMPLETED, tool_turns=turn_idx + 1)
