@@ -39,11 +39,11 @@ ETP="${ETP:-1}"
 # -----------------------------
 # Training constants (full)
 # -----------------------------
-NUM_ROLLOUT_FULL=3000
-ROLLOUT_BS_FULL=16
-N_SAMPLES_FULL=8
-GLOBAL_BS_FULL=128
-MAX_RESP_LEN_FULL=4096
+NUM_ROLLOUT_FULL="${NUM_ROLLOUT_FULL:-3000}"
+ROLLOUT_BS_FULL="${ROLLOUT_BS_FULL:-16}"
+N_SAMPLES_FULL="${N_SAMPLES_FULL:-8}"
+GLOBAL_BS_FULL="${GLOBAL_BS_FULL:-128}"
+MAX_RESP_LEN_FULL="${MAX_RESP_LEN_FULL:-4096}"
 
 # -----------------------------
 # DAPO / perf constants  (env-overridable)
@@ -54,6 +54,9 @@ ENABLE_PARTIAL_ROLLOUT="${ENABLE_PARTIAL_ROLLOUT:-1}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-8192}"
 SGLANG_MEM_FRAC="${SGLANG_MEM_FRAC:-0.45}"
 SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-256}"
+SGLANG_CUDA_GRAPH_BS="${SGLANG_CUDA_GRAPH_BS:-}"
+SGLANG_ENABLE_METRICS="${SGLANG_ENABLE_METRICS:-1}"
+ROUTER_BALANCE_ABS_THRESHOLD="${ROUTER_BALANCE_ABS_THRESHOLD:-}"
 
 # -----------------------------
 # Checkpoint / data paths
@@ -61,6 +64,8 @@ SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-256}"
 HF_CHECKPOINT="${HF_CHECKPOINT:-Stardust00/poker-qwen3-8b-merged}"
 REF_LOAD="${REF_LOAD:-/path/to/poker-qwen3-8b-merged_torch_dist}"
 LOAD_CKPT="${LOAD_CKPT:-}"
+NO_LOAD_OPTIM="${NO_LOAD_OPTIM:-0}"
+NO_LOAD_RNG="${NO_LOAD_RNG:-0}"
 SAVE_DIR="${SAVE_DIR:-/tmp/slime_holdem_qwen3_8b}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-20}"
 PROMPT_DATA="${PROMPT_DATA:-/path/to/holdem_train.jsonl}"
@@ -130,6 +135,12 @@ CKPT_ARGS=(
 )
 if [[ -n "${LOAD_CKPT}" ]]; then
     CKPT_ARGS+=(--load "${LOAD_CKPT}")
+fi
+if (( NO_LOAD_OPTIM )); then
+    CKPT_ARGS+=(--no-load-optim)
+fi
+if (( NO_LOAD_RNG )); then
+    CKPT_ARGS+=(--no-load-rng)
 fi
 
 ROLLOUT_ARGS=(
@@ -202,12 +213,16 @@ OPTIMIZER_ARGS=(
 
 WANDB_ARGS=()
 if [[ -n "${WANDB_KEY:-}" ]]; then
+    WANDB_MODE="${WANDB_MODE:-online}"
+    WANDB_DIR="${WANDB_DIR:-/root/autodl-tmp/exp/wandb_cache}"
     echo "WANDB_KEY set: enabling wandb logging (project=slime-holdem, group=qwen3-8B-holdem)"
     WANDB_ARGS+=(
         --use-wandb
         --wandb-project slime-holdem
         --wandb-group qwen3-8B-holdem
         --wandb-key "${WANDB_KEY}"
+        --wandb-mode "${WANDB_MODE}"
+        --wandb-dir "${WANDB_DIR}"
     )
 else
     echo "WANDB_KEY not set: wandb logging disabled"
@@ -218,6 +233,16 @@ SGLANG_ARGS=(
    --sglang-mem-fraction-static "${SGLANG_MEM_FRAC}"
    --sglang-server-concurrency "${SGLANG_SERVER_CONCURRENCY}"
 )
+if (( SGLANG_ENABLE_METRICS )); then
+    SGLANG_ARGS+=(--sglang-enable-metrics)
+fi
+if [[ -n "${SGLANG_CUDA_GRAPH_BS}" ]]; then
+    # Intentionally unquoted to allow multiple batch sizes.
+    SGLANG_ARGS+=(--sglang-cuda-graph-bs ${SGLANG_CUDA_GRAPH_BS})
+fi
+if [[ -n "${ROUTER_BALANCE_ABS_THRESHOLD}" ]]; then
+    SGLANG_ARGS+=(--router-balance-abs-threshold "${ROUTER_BALANCE_ABS_THRESHOLD}")
+fi
 
 MISC_ARGS=(
    --attention-dropout 0.0
@@ -242,7 +267,7 @@ ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${RAY_NUM_GPUS}"
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}:${REPO_ROOT}\",
+    \"PYTHONPATH\": \"/root/autodl-tmp/Megatron-LM:${SCRIPT_DIR}:${REPO_ROOT}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
   }
