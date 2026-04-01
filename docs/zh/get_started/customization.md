@@ -28,7 +28,6 @@ slime 通过函数路径参数提供了广泛的自定义能力。这些参数�
 | [`--custom-megatron-init-path`](#17-megatron-hook) | Megatron 设置后的自定义初始化。 |
 | [`--custom-megatron-before-log-prob-hook-path`](#17-megatron-hook) | log probability 计算前的自定义逻辑。 |
 | [`--custom-megatron-before-train-step-hook-path`](#17-megatron-hook) | 每个训练步骤前的自定义逻辑。 |
-| [`--slime-router-middleware-paths`](#18-slime-router-中间件---slime-router-middleware-paths) | 向 slime router 添加自定义中间件。 |
 
 ## 详细接口参考
 
@@ -40,7 +39,7 @@ slime 通过函数路径参数提供了广泛的自定义能力。这些参数�
 
 **函数签名**:
 ```python
-async def generate_rollout(args, rollout_id, *, evaluation=False) -> RolloutFnTrainOutput | RolloutFnEvalOutput
+def generate_rollout(args, rollout_id, data_source, evaluation=False) -> RolloutFnTrainOutput | RolloutFnEvalOutput
 ```
 
 **使用场景**:
@@ -140,7 +139,7 @@ class DynamicFilterOutput:
 
 **函数签名**:
 ```python
-def buffer_filter(samples: list[list[Sample]]) -> list[list[Sample]]
+def buffer_filter(args, rollout_id, buffer: list[list[Sample]], num_samples: int) -> list[list[Sample]]
 ```
 
 **使用场景**:
@@ -177,7 +176,7 @@ def filter_function(args, samples: list[Sample]) -> None
 
 **函数签名**:
 ```python
-def process_function(args, samples: list[list[Sample]]) -> None
+def process_function(args, samples: list[list[Sample]], data_source) -> None
 ```
 
 **使用场景**:
@@ -402,24 +401,49 @@ def custom_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler
 
 ---
 
-### 18. slime Router 中间件 (`--slime-router-middleware-paths`)
-
-**用途**: 向 slime router 添加自定义中间件用于请求处理。
-
-**使用场景**:
-- 请求/响应转换
-- 自定义路由逻辑
-- 缓存和优化
-
----
-
-### 19. MoE 路由重放
+### 18. MoE 路由重放
 
 通过记录和重放专家路由决策来稳定 MoE RL 训练。
 
 | 参数 | 说明 |
 | --- | --- |
 | `--use-routing-replay` | 训练中前向-反向路由一致性。([arXiv:2507.18071](https://arxiv.org/abs/2507.18071)) |
-| `--use-rollout-routing-replay` | R3：在训练时重放 rollout 阶段的路由。**需要 `--use-slime-router`**。([arXiv:2510.11370](https://arxiv.org/abs/2510.11370)) |
+| `--use-rollout-routing-replay` | R3：在训练时重放 rollout 阶段的路由。slime 默认的 `sglang_router` 路径支持该功能。([arXiv:2510.11370](https://arxiv.org/abs/2510.11370)) |
 
-关于 R3 和 SlimeRouter 的详细说明，请参阅 [Slime Router](../advanced/slime-router.md)。
+## 自定义函数路径的测试
+
+slime 现在也提供了一组 CPU 契约测试，用于校验这些 customization 接口。测试会通过字符串形式的导入路径来动态加载组件，因此既能回归仓库内置 hook，也能验证用户通过和训练时完全相同的 CLI 参数传入的自定义实现。
+
+这些测试统一放在 `tests/plugin_contracts/` 目录下，并按 hook 形态归并成少数几个文件：
+
+- `tests/plugin_contracts/test_plugin_rollout_contracts.py`
+  覆盖 `--rollout-function-path`
+- `tests/plugin_contracts/test_plugin_generate_contracts.py`
+  覆盖 `--custom-generate-function-path`
+- `tests/plugin_contracts/test_plugin_path_loading_contracts.py`
+  覆盖 `--eval-function-path`、`--custom-rm-path`、`--dynamic-sampling-filter-path`、`--buffer-filter-path`、`--data-source-path`、`--rollout-sample-filter-path`、`--rollout-all-samples-process-path`
+- `tests/plugin_contracts/test_plugin_runtime_hook_contracts.py`
+  覆盖 `--custom-rollout-log-function-path`、`--custom-eval-rollout-log-function-path`、`--custom-reward-post-process-path`、`--custom-convert-samples-to-train-data-path`、`--rollout-data-postprocess-path`
+
+本地运行全部 customization 契约测试：
+
+```bash
+python -m pytest \
+  tests/plugin_contracts/test_plugin_rollout_contracts.py \
+  tests/plugin_contracts/test_plugin_generate_contracts.py \
+  tests/plugin_contracts/test_plugin_path_loading_contracts.py \
+  tests/plugin_contracts/test_plugin_runtime_hook_contracts.py
+```
+
+每个测试文件也支持直接通过 `python tests/plugin_contracts/<file>.py` 执行，这样可以和 `run-ci-changed` 保持兼容。
+
+CI 中也提供了独立的 `run-ci-plugin-contracts` label，给 PR 打上该标签后会并行运行上述全部四个契约测试（无需 GPU）。
+
+如果你要验证自己的自定义实现，可以直接设置环境变量，例如 `SLIME_CONTRACT_ROLLOUT_FUNCTION_PATH`、`SLIME_CONTRACT_CUSTOM_RM_PATH`，也可以在直接运行测试文件时传参，例如：
+
+```bash
+python tests/plugin_contracts/test_plugin_rollout_contracts.py \
+  --rollout-function-path my_project.custom_rollout.generate_rollout
+```
+
+验证时只需将插件路径替换成你的模块路径，断言逻辑（函数签名、返回结构、副作用）保持不变即可。
