@@ -1,0 +1,9 @@
+use_tis: true
+tis_level: "token"
+tis_mode: "clip"
+tis_lower_bound: 0.5
+tis_upper_bound: 2.0
+tis_batch_normalize: true
+
+fully_async_max_staleness: 1
+fully_async_drop_unknown_version: true

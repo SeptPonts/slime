@@ -87,6 +87,12 @@ GRPO_ARGS=(
    --use-tis
 )
 
+CUSTOM_ARGS=(
+   --keep-old-actor
+   --custom-config-path examples/fully_async/fully_async_offpolicy.yaml
+   --custom-tis-function-path examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp
+)
+
 OPTIMIZER_ARGS=(
    --optimizer adam
    --lr 1e-6
@@ -134,6 +140,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${ROLLOUT_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
    ${GRPO_ARGS[@]} \
+   ${CUSTOM_ARGS[@]} \
    ${PERF_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]}

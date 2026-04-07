@@ -4,10 +4,19 @@ import queue
 import threading
 import time
 
+from slime.rollout.base_types import RolloutFnTrainOutput
+from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
+
 # Import core functions from sglang_rollout directly to avoid code duplication
 from slime.rollout.sglang_rollout import GenerateState, generate_and_rm_group
 from slime.utils.async_utils import run
+from slime.utils.misc import load_function
 from slime.utils.types import Sample
+
+try:
+    from .staleness import StalenessTracker, build_staleness_metrics, evaluate_group_staleness
+except ImportError:
+    from staleness import StalenessTracker, build_staleness_metrics, evaluate_group_staleness
 
 # Global worker manager
 _global_worker = None
@@ -48,6 +57,7 @@ class AsyncRolloutWorker:
         self.output_queue = queue.Queue(maxsize=1000)  # Continuous output queue
         self.worker_thread = None
         self.state = GenerateState(args)
+        self.staleness_tracker = StalenessTracker()
 
     async def continuous_worker_loop(self):
         """Continuous work loop - constantly get data from data_buffer and process"""
@@ -146,7 +156,7 @@ class AsyncRolloutWorker:
         return self.output_queue.qsize()
 
 
-async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[list[Sample]]:
+async def generate_rollout_async(args, rollout_id: int, data_buffer) -> RolloutFnTrainOutput:
     """
     Simplified asynchronous rollout generation - using global continuous worker
     """
@@ -155,12 +165,32 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
     # Get global worker, which will run continuously
     worker = get_global_worker(args, data_buffer)
 
+    dynamic_filter = load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path else None
+    rollout_sample_filter = (
+        load_function(args.rollout_sample_filter_path) if args.rollout_sample_filter_path else None
+    )
+    rollout_all_samples_process = (
+        load_function(args.rollout_all_samples_process_path) if args.rollout_all_samples_process_path else None
+    )
+    metric_gatherer = MetricGatherer()
+
+    if not hasattr(worker, "staleness_tracker"):
+        worker.staleness_tracker = StalenessTracker()
+
+    max_staleness = getattr(args, "fully_async_max_staleness", None)
+    drop_unknown_version = getattr(args, "fully_async_drop_unknown_version", True)
+
     # Simplified: directly use rollout_batch_size as target
     target_data_size = args.rollout_batch_size
 
     data = []
+    all_data = []
     completed_groups = {}
     do_print = True
+    stale_drop_count = 0
+    unknown_version_drop_count = 0
+    inspected_group_count = 0
+    accepted_versions = []
 
     print(f"Starting async rollout generation for {target_data_size} groups")
     print(f"Global worker queue size: {worker.get_queue_size()}")
@@ -210,15 +240,44 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
                 # don't count as processed for training
                 continue
 
+            all_data.append(group)
+            inspected_group_count += 1
+            staleness_decision = evaluate_group_staleness(
+                group,
+                worker.staleness_tracker,
+                max_staleness=max_staleness,
+                drop_unknown_version=drop_unknown_version,
+            )
+            if not staleness_decision.keep:
+                if staleness_decision.reason == "stale":
+                    stale_drop_count += 1
+                elif staleness_decision.reason == "unknown_version":
+                    unknown_version_drop_count += 1
+                print(
+                    "Dropped group "
+                    f"{group_id} due to {staleness_decision.reason}; "
+                    f"group_weight_version={staleness_decision.group_weight_version}, "
+                    f"latest_seen_weight_version={worker.staleness_tracker.latest_seen_weight_version}",
+                    flush=True,
+                )
+                continue
+
+            dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
+            if not dynamic_filter_output.keep:
+                metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
+                continue
+
             if do_print:
                 print(
-                    f"First rollout sample: {[group[0].prompt + group[0].response]}, "
+                    f"First rollout sample: {[str(group[0].prompt) + group[0].response]}, "
                     f"label: {group[0].label}, reward: {group[0].reward}",
                     flush=True,
                 )
                 do_print = False
 
-            # Simplified: directly add samples, no filters used
+            if staleness_decision.group_weight_version is not None:
+                accepted_versions.append(staleness_decision.group_weight_version)
+
             data.append(group)
             processed_any = True
 
@@ -241,21 +300,36 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
 
     if data:
         print(
-            f"Finish rollout: {[data[-1][0].prompt + data[-1][0].response]}, "
+            f"Finish rollout: {[str(data[-1][0].prompt) + data[-1][0].response]}, "
             f"label: {data[-1][0].label}, reward: {data[-1][0].reward}",
             flush=True,
         )
 
     data = sorted(data, key=lambda group: group[0].index)
-    return data
+    all_data = sorted(all_data, key=lambda group: group[0].index)
+
+    if rollout_sample_filter is not None:
+        rollout_sample_filter(args, data)
+
+    if rollout_all_samples_process is not None:
+        rollout_all_samples_process(args, all_data, data_buffer)
+
+    metrics = metric_gatherer.collect()
+    metrics |= build_staleness_metrics(
+        stale_drop_count=stale_drop_count,
+        unknown_version_drop_count=unknown_version_drop_count,
+        inspected_group_count=inspected_group_count,
+        accepted_versions=accepted_versions,
+        latest_seen_weight_version=worker.staleness_tracker.latest_seen_weight_version,
+    )
+    return RolloutFnTrainOutput(samples=data, metrics=metrics)
 
 
 def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation=False):
     if evaluation:
         raise ValueError("Evaluation mode not supported in simple async rollout")
 
-    completed_samples = run(generate_rollout_async(args, rollout_id, data_buffer))
-    return completed_samples
+    return run(generate_rollout_async(args, rollout_id, data_buffer))
 
 
 # Register exit cleanup function
